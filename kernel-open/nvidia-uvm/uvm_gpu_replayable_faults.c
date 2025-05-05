@@ -23,6 +23,7 @@
 
 #include "linux/sort.h"
 #include "nv_uvm_interface.h"
+#include "uvm_api.h"
 #include "uvm_common.h"
 #include "uvm_linux.h"
 #include "uvm_global.h"
@@ -3114,5 +3115,15 @@ NV_STATUS uvm_test_drain_replayable_faults(UVM_TEST_DRAIN_REPLAYABLE_FAULTS_PARA
 
     uvm_gpu_release(gpu);
 
+    return status;
+}
+
+NV_STATUS uvm_api_stall_process_on_pagefault(UVM_STALL_PROCESS_ON_PAGEFAULT_PARAMS *params,
+										 struct file *filp)
+{
+    NV_STATUS status = NV_OK;
+    NvS32 pid = params->pid;
+    NvBool stall = params->stall;
+    printk(KERN_INFO "UVM: uvm_api_stall_process_on_pagefault %s pid %d\n", (stall ? "stall" : "continue"), pid);
     return status;
 }

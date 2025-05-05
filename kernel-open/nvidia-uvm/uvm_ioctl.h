@@ -1125,6 +1125,14 @@ typedef struct
     NV_STATUS       rmStatus; // OUT
 } UVM_CLEAR_ALL_ACCESS_COUNTERS_PARAMS;
 
+#define UVM_STALL_PROCESS_ON_PAGEFAULT                                UVM_IOCTL_BASE(80)
+typedef struct
+{
+    NvS32                   pid;      // IN
+    NvBool                  stall;    // IN
+    NV_STATUS               rmStatus; // OUT
+} UVM_STALL_PROCESS_ON_PAGEFAULT_PARAMS;
+
 //
 // Temporary ioctls which should be removed before UVM 8 release
 // Number backwards from 2047 - highest custom ioctl function number

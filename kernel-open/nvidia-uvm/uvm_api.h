@@ -259,5 +259,6 @@ NV_STATUS uvm_api_alloc_semaphore_pool(UVM_ALLOC_SEMAPHORE_POOL_PARAMS *params, 
 NV_STATUS uvm_api_populate_pageable(const UVM_POPULATE_PAGEABLE_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_alloc_device_p2p(UVM_ALLOC_DEVICE_P2P_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_clear_all_access_counters(UVM_CLEAR_ALL_ACCESS_COUNTERS_PARAMS *params, struct file *filp);
+NV_STATUS uvm_api_stall_process_on_pagefault(UVM_STALL_PROCESS_ON_PAGEFAULT_PARAMS *params, struct file *filp);
 
 #endif // __UVM_API_H__

@@ -1090,6 +1090,7 @@ static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_V2,uvm_api_tools_get_processor_uuid_table_v2);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_ALLOC_DEVICE_P2P,               uvm_api_alloc_device_p2p);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_CLEAR_ALL_ACCESS_COUNTERS,      uvm_api_clear_all_access_counters);
+        UVM_ROUTE_CMD_STACK_NO_INIT_CHECK(UVM_STALL_PROCESS_ON_PAGEFAULT,     uvm_api_stall_process_on_pagefault);
     }
 
     // Try the test ioctls if none of the above matched
