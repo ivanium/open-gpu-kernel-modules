@@ -21,6 +21,7 @@
 
 *******************************************************************************/
 
+#include "linux/hashtable.h"
 #include "linux/sort.h"
 #include "nv_uvm_interface.h"
 #include "uvm_api.h"
@@ -115,6 +116,16 @@ module_param(uvm_perf_fault_max_throttle_per_service, uint, S_IRUGO);
 
 static unsigned uvm_perf_fault_coalesce = 1;
 module_param(uvm_perf_fault_coalesce, uint, S_IRUGO);
+
+struct uvm_stall_on_pagefault_buffer_entry_struct
+{
+    struct hlist_node node;
+    uvm_fault_buffer_entry_t entry;
+};
+typedef struct uvm_stall_on_pagefault_buffer_entry_struct uvm_stall_on_pagefault_buffer_entry_t;
+
+static NvS32 uvm_stall_on_pagefault_pid = -1;
+DEFINE_HASHTABLE(uvm_stall_on_pagefault_buffer, 8);
 
 // This function is used for both the initial fault buffer initialization and
 // the power management resume path.
@@ -2259,6 +2270,39 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
 
         UVM_ASSERT(current_entry->va_space);
 
+        if (uvm_stall_on_pagefault_pid != -1) {
+            struct mm_struct *mm = current_entry->va_space->va_space_mm.mm;
+            if (mm) {
+                pid_t pid = mm->owner->pid;
+                if (pid == uvm_stall_on_pagefault_pid) {
+                    // We are in the process of servicing a fault for the
+                    // process we want to stall. Wait for the fault to be
+                    // serviced before continuing.
+                    uvm_stall_on_pagefault_buffer_entry_t *stall_buffer_entry;
+                    // memcpy(&stall_buffer->entry, current_entry, sizeof(uvm_fault_buffer_entry_t));
+                    bool found = false;
+                    hash_for_each_possible(uvm_stall_on_pagefault_buffer, stall_buffer_entry, node, current_entry->fault_address) {
+                        if (stall_buffer_entry->entry.fault_address == current_entry->fault_address &&
+                                stall_buffer_entry->entry.instance_ptr.address == current_entry->instance_ptr.address &&
+                                stall_buffer_entry->entry.instance_ptr.aperture == current_entry->instance_ptr.aperture) {
+                            found = true;
+                            ++stall_buffer_entry->entry.num_instances;
+                            uvm_fault_buffer_entry_t *coalesced_entry = uvm_kvmalloc_zero(sizeof(uvm_fault_buffer_entry_t));
+                            memcpy(coalesced_entry, current_entry, sizeof(uvm_fault_buffer_entry_t));
+                            list_add(&coalesced_entry->merged_instances_list, &stall_buffer_entry->entry.merged_instances_list);
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        uvm_stall_on_pagefault_buffer_entry_t *new_entry = uvm_kvmalloc_zero(sizeof(uvm_stall_on_pagefault_buffer_entry_t));
+                        memcpy(&new_entry->entry, current_entry, sizeof(uvm_fault_buffer_entry_t));
+                        hash_add(uvm_stall_on_pagefault_buffer, &new_entry->node, current_entry->fault_address);
+                    }
+                    continue;
+                }
+            }
+        }
+
         if (current_entry->va_space != va_space) {
             if (prev_gpu_va_space) {
                 // TLB entries are invalidated per GPU VA space
@@ -3118,12 +3162,43 @@ NV_STATUS uvm_test_drain_replayable_faults(UVM_TEST_DRAIN_REPLAYABLE_FAULTS_PARA
     return status;
 }
 
+static NV_STATUS uvm_parent_gpu_continue_replayable_faults(void) {
+    // TODO: Implement this function
+    uvm_stall_on_pagefault_buffer_entry_t *entry;
+    struct hlist_node *tmp;
+    size_t bkt;
+    hash_for_each_safe(uvm_stall_on_pagefault_buffer, bkt, tmp, entry, node) {
+        printk(KERN_INFO "UVM: Continue replayable faults for address 0x%llx, nothing to do yet\n", entry->entry.fault_address);
+    }
+    return NV_OK;
+}
+
 NV_STATUS uvm_api_stall_process_on_pagefault(UVM_STALL_PROCESS_ON_PAGEFAULT_PARAMS *params,
-										 struct file *filp)
+                                         struct file *filp)
 {
     NV_STATUS status = NV_OK;
     NvS32 pid = params->pid;
     NvBool stall = params->stall;
     printk(KERN_INFO "UVM: uvm_api_stall_process_on_pagefault %s pid %d\n", (stall ? "stall" : "continue"), pid);
+    if (pid < 0) {
+        printk(KERN_ERR "UVM: uvm_api_stall_process_on_pagefault invalid pid %d\n", pid);
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    if (stall) {
+        if (uvm_stall_on_pagefault_pid != -1) {
+            printk(KERN_ERR "UVM: uvm_api_stall_process_on_pagefault already stalled\n");
+            return NV_ERR_INVALID_STATE;
+        }
+
+        uvm_stall_on_pagefault_pid = pid;
+    } else {
+        if (uvm_stall_on_pagefault_pid == -1) {
+            return NV_OK;
+        }
+
+        status = uvm_parent_gpu_continue_replayable_faults();
+
+        uvm_stall_on_pagefault_pid = -1;
+    }
     return status;
 }
