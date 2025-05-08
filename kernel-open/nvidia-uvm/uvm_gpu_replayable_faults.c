@@ -2243,7 +2243,8 @@ done:
 // Fatal faults are marked for later processing by the caller.
 static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
                                      fault_service_mode_t service_mode,
-                                     uvm_fault_service_batch_context_t *batch_context)
+                                     uvm_fault_service_batch_context_t *batch_context,
+                                     bool skip_stall_on_pagefault)
 {
     NV_STATUS status = NV_OK;
     NvU32 i;
@@ -2270,7 +2271,7 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
 
         UVM_ASSERT(current_entry->va_space);
 
-        if (uvm_stall_on_pagefault_pid != -1) {
+        if (!skip_stall_on_pagefault && uvm_stall_on_pagefault_pid != -1) {
             struct mm_struct *mm = current_entry->va_space->va_space_mm.mm;
             if (mm) {
                 pid_t pid = mm->owner->pid;
@@ -2286,10 +2287,15 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
                                 stall_buffer_entry->entry.instance_ptr.address == current_entry->instance_ptr.address &&
                                 stall_buffer_entry->entry.instance_ptr.aperture == current_entry->instance_ptr.aperture) {
                             found = true;
-                            ++stall_buffer_entry->entry.num_instances;
-                            uvm_fault_buffer_entry_t *coalesced_entry = uvm_kvmalloc_zero(sizeof(uvm_fault_buffer_entry_t));
-                            memcpy(coalesced_entry, current_entry, sizeof(uvm_fault_buffer_entry_t));
-                            list_add(&coalesced_entry->merged_instances_list, &stall_buffer_entry->entry.merged_instances_list);
+
+                            // Following code is commented out because it will quickly consume host memory and cause OOM
+                            // TO BE FIXED IN THE FUTURE
+                            //
+                            // ++stall_buffer_entry->entry.num_instances;
+                            // uvm_fault_buffer_entry_t *coalesced_entry = uvm_kvmalloc_zero(sizeof(uvm_fault_buffer_entry_t));
+                            // memcpy(coalesced_entry, current_entry, sizeof(uvm_fault_buffer_entry_t));
+                            // list_add(&coalesced_entry->merged_instances_list, &stall_buffer_entry->entry.merged_instances_list);
+
                             break;
                         }
                     }
@@ -2877,7 +2883,7 @@ static NV_STATUS cancel_faults_precise_tlb(uvm_gpu_t *gpu, uvm_fault_service_bat
 
         // 8) Service all non-fatal faults and mark all non-serviceable faults
         // as fatal
-        status = service_fault_batch(gpu->parent, FAULT_SERVICE_MODE_CANCEL, batch_context);
+        status = service_fault_batch(gpu->parent, FAULT_SERVICE_MODE_CANCEL, batch_context, true);
         UVM_ASSERT(batch_context->num_replays == 0);
         if (status == NV_ERR_NO_MEMORY)
             continue;
@@ -2993,7 +2999,7 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         else if (status != NV_OK)
             break;
 
-        status = service_fault_batch(parent_gpu, FAULT_SERVICE_MODE_REGULAR, batch_context);
+        status = service_fault_batch(parent_gpu, FAULT_SERVICE_MODE_REGULAR, batch_context, false);
 
         // We may have issued replays even if status != NV_OK if
         // UVM_PERF_FAULT_REPLAY_POLICY_BLOCK is being used or the fault buffer
@@ -3168,7 +3174,10 @@ static NV_STATUS uvm_parent_gpu_continue_replayable_faults(void) {
     struct hlist_node *tmp;
     size_t bkt;
     hash_for_each_safe(uvm_stall_on_pagefault_buffer, bkt, tmp, entry, node) {
-        printk(KERN_INFO "UVM: Continue replayable faults for address 0x%llx, nothing to do yet\n", entry->entry.fault_address);
+        printk(KERN_INFO "UVM: Continue replayable faults for address 0x%llx\n", entry->entry.fault_address);
+        push_replay_on_gpu(entry->entry.gpu, UVM_FAULT_REPLAY_TYPE_START, NULL);
+        // hash_del(&entry->node);
+        // uvm_kvfree(entry);
     }
     return NV_OK;
 }
@@ -3192,13 +3201,13 @@ NV_STATUS uvm_api_stall_process_on_pagefault(UVM_STALL_PROCESS_ON_PAGEFAULT_PARA
 
         uvm_stall_on_pagefault_pid = pid;
     } else {
-        if (uvm_stall_on_pagefault_pid == -1) {
-            return NV_OK;
-        }
-
-        status = uvm_parent_gpu_continue_replayable_faults();
+        // if (uvm_stall_on_pagefault_pid == -1) {
+        //     return NV_OK;
+        // }
 
         uvm_stall_on_pagefault_pid = -1;
+
+        status = uvm_parent_gpu_continue_replayable_faults();
     }
     return status;
 }
