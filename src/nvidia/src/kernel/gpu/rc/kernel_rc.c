@@ -380,6 +380,8 @@ krcReportXid_IMPL
                                 gpuGetDomain(pGpu), gpuGetBus(pGpu), gpuGetDevice(pGpu));
         }
 
+        os_dump_stack();
+
         #undef XID_PRINT_WITH_ATTR
 
         portMemFree(allocProcName);

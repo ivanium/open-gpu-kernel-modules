@@ -127,6 +127,13 @@ typedef struct uvm_stall_on_pagefault_buffer_entry_struct uvm_stall_on_pagefault
 static NvS32 uvm_stall_on_pagefault_pid = -1;
 DEFINE_HASHTABLE(uvm_stall_on_pagefault_buffer, 8);
 
+struct uvm_stall_on_pagefault_list_entry_struct
+{
+    struct list_head node;
+    uvm_fault_buffer_entry_t *entry;
+};
+typedef struct uvm_stall_on_pagefault_list_entry_struct uvm_stall_on_pagefault_list_entry_t;
+
 // This function is used for both the initial fault buffer initialization and
 // the power management resume path.
 static void fault_buffer_reinit_replayable_faults(uvm_parent_gpu_t *parent_gpu)
@@ -855,7 +862,8 @@ static bool fetch_fault_buffer_try_merge_entry(uvm_fault_buffer_entry_t *current
 // the faults in each uTLB in order to guarantee precise fault attribution.
 static NV_STATUS fetch_fault_buffer_entries(uvm_parent_gpu_t *parent_gpu,
                                             uvm_fault_service_batch_context_t *batch_context,
-                                            fault_fetch_mode_t fetch_mode)
+                                            fault_fetch_mode_t fetch_mode, 
+                                            struct list_head *stall_on_pagefault_list)
 {
     NvU32 get;
     NvU32 put;
@@ -874,13 +882,15 @@ static NV_STATUS fetch_fault_buffer_entries(uvm_parent_gpu_t *parent_gpu,
 
     fault_cache = batch_context->fault_cache;
 
-    get = replayable_faults->cached_get;
+    if (!stall_on_pagefault_list) {
+        get = replayable_faults->cached_get;
 
-    // Read put pointer from GPU and cache it
-    if (get == replayable_faults->cached_put)
-        replayable_faults->cached_put = parent_gpu->fault_buffer_hal->read_put(parent_gpu);
+        // Read put pointer from GPU and cache it
+        if (get == replayable_faults->cached_put)
+            replayable_faults->cached_put = parent_gpu->fault_buffer_hal->read_put(parent_gpu);
 
-    put = replayable_faults->cached_put;
+        put = replayable_faults->cached_put;
+    }
 
     batch_context->is_single_instance_ptr = true;
     batch_context->last_fault = NULL;
@@ -895,36 +905,48 @@ static NV_STATUS fetch_fault_buffer_entries(uvm_parent_gpu_t *parent_gpu,
     }
     batch_context->max_utlb_id = 0;
 
-    if (get == put)
-        goto done;
+    if (!stall_on_pagefault_list) {
+        if (get == put) {
+            goto done;
+        }
+    }
 
     // Parse until get != put and have enough space to cache.
-    while ((get != put) &&
+    uvm_stall_on_pagefault_list_entry_t *list_entry = (stall_on_pagefault_list) ? list_first_entry(stall_on_pagefault_list, uvm_stall_on_pagefault_list_entry_t, node) : NULL;
+    while (((stall_on_pagefault_list) ? (!list_entry_is_head(list_entry, stall_on_pagefault_list, node)) : (get != put)) &&
            (fetch_mode == FAULT_FETCH_MODE_ALL || fault_index < parent_gpu->fault_buffer.max_batch_size)) {
         bool is_same_instance_ptr = true;
         uvm_fault_buffer_entry_t *current_entry = &fault_cache[fault_index];
         uvm_fault_utlb_info_t *current_tlb;
 
-        // We cannot just wait for the last entry (the one pointed by put) to
-        // become valid, we have to do it individually since entries can be
-        // written out of order
-        UVM_SPIN_WHILE(!parent_gpu->fault_buffer_hal->entry_is_valid(parent_gpu, get), &spin) {
-            // We have some entry to work on. Let's do the rest later.
-            if (fetch_mode == FAULT_FETCH_MODE_BATCH_READY && fault_index > 0)
-                goto done;
+        if (stall_on_pagefault_list) {
+            memcpy(current_entry, list_entry->entry, sizeof(uvm_fault_buffer_entry_t));
+            list_entry = list_next_entry(list_entry, node);
+        } else {
+            // We cannot just wait for the last entry (the one pointed by put) to
+            // become valid, we have to do it individually since entries can be
+            // written out of order
+            UVM_SPIN_WHILE(!parent_gpu->fault_buffer_hal->entry_is_valid(parent_gpu, get), &spin) {
+                // We have some entry to work on. Let's do the rest later.
+                if (fetch_mode == FAULT_FETCH_MODE_BATCH_READY && fault_index > 0)
+                    goto done;
 
-            status = uvm_global_get_status();
+                status = uvm_global_get_status();
+                if (status != NV_OK)
+                    goto done;
+            }
+
+            // Prevent later accesses being moved above the read of the valid bit
+            smp_mb__after_atomic();
+
+            // Got valid bit set. Let's cache.
+            status = parent_gpu->fault_buffer_hal->parse_replayable_entry(parent_gpu, get, current_entry);
             if (status != NV_OK)
                 goto done;
+            ++get;
+            if (get == replayable_faults->max_faults)
+                get = 0;
         }
-
-        // Prevent later accesses being moved above the read of the valid bit
-        smp_mb__after_atomic();
-
-        // Got valid bit set. Let's cache.
-        status = parent_gpu->fault_buffer_hal->parse_replayable_entry(parent_gpu, get, current_entry);
-        if (status != NV_OK)
-            goto done;
 
         // The GPU aligns the fault addresses to 4k, but all of our tracking is
         // done in PAGE_SIZE chunks which might be larger.
@@ -983,13 +1005,11 @@ static NV_STATUS fetch_fault_buffer_entries(uvm_parent_gpu_t *parent_gpu,
 
     next_fault:
         ++fault_index;
-        ++get;
-        if (get == replayable_faults->max_faults)
-            get = 0;
     }
 
 done:
-    write_get(parent_gpu, get);
+    if (!stall_on_pagefault_list)
+        write_get(parent_gpu, get);
 
     batch_context->num_cached_faults = fault_index;
     batch_context->num_coalesced_faults = num_coalesced_faults;
@@ -2121,7 +2141,7 @@ static NV_STATUS service_fault_batch_for_cancel(uvm_fault_service_batch_context_
     batch_context->fatal_gpu                   = NULL;
     batch_context->has_throttled_faults        = false;
 
-    status = fetch_fault_buffer_entries(gpu->parent, batch_context, FAULT_FETCH_MODE_ALL);
+    status = fetch_fault_buffer_entries(gpu->parent, batch_context, FAULT_FETCH_MODE_ALL, NULL);
     if (status != NV_OK)
         goto done;
 
@@ -2304,6 +2324,7 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
                         memcpy(&new_entry->entry, current_entry, sizeof(uvm_fault_buffer_entry_t));
                         hash_add(uvm_stall_on_pagefault_buffer, &new_entry->node, current_entry->fault_address);
                     }
+                    ++i;
                     continue;
                 }
             }
@@ -2841,7 +2862,7 @@ static NV_STATUS cancel_faults_precise_tlb(uvm_gpu_t *gpu, uvm_fault_service_bat
         batch_context->has_throttled_faults        = false;
 
         // 5) Fetch all faults from buffer
-        status = fetch_fault_buffer_entries(gpu->parent, batch_context, FAULT_FETCH_MODE_ALL);
+        status = fetch_fault_buffer_entries(gpu->parent, batch_context, FAULT_FETCH_MODE_ALL, NULL);
         if (status != NV_OK)
             break;
 
@@ -2954,7 +2975,7 @@ static void enable_disable_prefetch_faults(uvm_parent_gpu_t *parent_gpu,
     }
 }
 
-void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
+static NV_STATUS uvm_parent_gpu_service_replayable_faults_internal(uvm_parent_gpu_t *parent_gpu, struct list_head *stall_on_pagefault_list)
 {
     NvU32 num_replays = 0;
     NvU32 num_batches = 0;
@@ -2981,7 +3002,9 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         batch_context->fatal_gpu                   = NULL;
         batch_context->has_throttled_faults        = false;
 
-        status = fetch_fault_buffer_entries(parent_gpu, batch_context, FAULT_FETCH_MODE_BATCH_READY);
+        printk(KERN_INFO "UVM: uvm_parent_gpu_service_replayable_faults fetch fault buffer entries batch %d start\n", num_batches);
+        status = fetch_fault_buffer_entries(parent_gpu, batch_context, FAULT_FETCH_MODE_BATCH_READY, stall_on_pagefault_list);
+        printk(KERN_INFO "UVM: uvm_parent_gpu_service_replayable_faults fetch fault buffer entries batch %d end\n", num_batches);
         if (status != NV_OK)
             break;
 
@@ -2990,7 +3013,9 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 
         ++batch_context->batch_id;
 
+        printk(KERN_INFO "UVM: uvm_parent_gpu_service_replayable_faults preprocess fault batch %d start\n", num_batches);
         status = preprocess_fault_batch(parent_gpu, batch_context);
+        printk(KERN_INFO "UVM: uvm_parent_gpu_service_replayable_faults preprocess fault batch %d end\n", num_batches);
 
         num_replays += batch_context->num_replays;
 
@@ -2999,7 +3024,9 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         else if (status != NV_OK)
             break;
 
-        status = service_fault_batch(parent_gpu, FAULT_SERVICE_MODE_REGULAR, batch_context, false);
+        printk(KERN_INFO "UVM: uvm_parent_gpu_service_replayable_faults service fault batch %d start\n", num_batches);
+        status = service_fault_batch(parent_gpu, FAULT_SERVICE_MODE_REGULAR, batch_context, stall_on_pagefault_list != NULL);
+        printk(KERN_INFO "UVM: uvm_parent_gpu_service_replayable_faults service fault batch %d end\n", num_batches);
 
         // We may have issued replays even if status != NV_OK if
         // UVM_PERF_FAULT_REPLAY_POLICY_BLOCK is being used or the fault buffer
@@ -3074,8 +3101,18 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 
     uvm_tracker_deinit(&batch_context->tracker);
 
-    if (status != NV_OK)
+    if (status != NV_OK) {
         UVM_DBG_PRINT("Error servicing replayable faults on GPU: %s\n", uvm_parent_gpu_name(parent_gpu));
+    }
+
+    return status;
+}
+
+void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
+{
+    printk(KERN_INFO "UVM: uvm_parent_gpu_service_replayable_faults start handling pagefaults\n");
+    uvm_parent_gpu_service_replayable_faults_internal(parent_gpu, NULL);
+    printk(KERN_INFO "UVM: uvm_parent_gpu_service_replayable_faults end handling pagefaults\n");
 }
 
 void uvm_parent_gpu_enable_prefetch_faults(uvm_parent_gpu_t *parent_gpu)
@@ -3170,14 +3207,20 @@ NV_STATUS uvm_test_drain_replayable_faults(UVM_TEST_DRAIN_REPLAYABLE_FAULTS_PARA
 
 static NV_STATUS uvm_parent_gpu_continue_replayable_faults(void) {
     // TODO: Implement this function
-    uvm_stall_on_pagefault_buffer_entry_t *entry;
+    uvm_stall_on_pagefault_buffer_entry_t *hashlist_entry;
     struct hlist_node *tmp;
     size_t bkt;
-    hash_for_each_safe(uvm_stall_on_pagefault_buffer, bkt, tmp, entry, node) {
-        printk(KERN_INFO "UVM: Continue replayable faults for address 0x%llx\n", entry->entry.fault_address);
-        push_replay_on_gpu(entry->entry.gpu, UVM_FAULT_REPLAY_TYPE_START, NULL);
-        // hash_del(&entry->node);
-        // uvm_kvfree(entry);
+    hash_for_each_safe(uvm_stall_on_pagefault_buffer, bkt, tmp, hashlist_entry, node) {
+        printk(KERN_INFO "UVM: Continue replayable faults for address 0x%llx\n", hashlist_entry->entry.fault_address);
+        LIST_HEAD(stall_on_pagefault_list);
+        uvm_stall_on_pagefault_list_entry_t list_entry = {
+            .node = LIST_HEAD_INIT(list_entry.node),
+            .entry = &hashlist_entry->entry,
+        };
+        list_add(&list_entry.node, &stall_on_pagefault_list);
+        uvm_parent_gpu_service_replayable_faults_internal(hashlist_entry->entry.gpu->parent, &stall_on_pagefault_list);
+        hash_del(&hashlist_entry->node);
+        uvm_kvfree(hashlist_entry);
     }
     return NV_OK;
 }
@@ -3201,13 +3244,14 @@ NV_STATUS uvm_api_stall_process_on_pagefault(UVM_STALL_PROCESS_ON_PAGEFAULT_PARA
 
         uvm_stall_on_pagefault_pid = pid;
     } else {
-        // if (uvm_stall_on_pagefault_pid == -1) {
-        //     return NV_OK;
-        // }
+        if (uvm_stall_on_pagefault_pid == -1) {
+            return NV_OK;
+        }
 
         uvm_stall_on_pagefault_pid = -1;
 
-        status = uvm_parent_gpu_continue_replayable_faults();
+        // Buggy: Stall on continuing replayable faults because trying to handle a pagefault from dead CUDA kernel
+        // status = uvm_parent_gpu_continue_replayable_faults();
     }
     return status;
 }
