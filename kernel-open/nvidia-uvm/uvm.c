@@ -21,12 +21,14 @@
 
 *******************************************************************************/
 
+#include "nv_uvm_interface.h"
 #include "uvm_api.h"
 #include "uvm_global.h"
 #include "uvm_gpu_replayable_faults.h"
 #include "uvm_tools_init.h"
 #include "uvm_lock.h"
 #include "uvm_test.h"
+#include "uvm_user_channel.h"
 #include "uvm_va_space.h"
 #include "uvm_va_space_mm.h"
 #include "uvm_va_range.h"
@@ -1016,6 +1018,74 @@ static NV_STATUS uvm_api_pageable_mem_access(UVM_PAGEABLE_MEM_ACCESS_PARAMS *par
     return NV_OK;
 }
 
+static NV_STATUS uvm_api_is_initialized(UVM_IS_INITIALIZED_PARAMS *params, struct file *filp)
+{
+    params->initialized = (uvm_fd_va_space(filp) != NULL);
+    return NV_OK;
+}
+
+static NV_STATUS uvm_api_ctrl_cmd_operate_channel_group(UVM_CTRL_CMD_OPERATE_CHANNEL_GROUP_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_gpu_va_space_t *gpu_va_space;
+    uvm_user_channel_group_t *user_channel_group;
+    NV_STATUS status;
+
+    for_each_gpu_va_space(gpu_va_space, va_space) {
+        list_for_each_entry(user_channel_group, &gpu_va_space->registered_channel_groups, channel_group_node) {
+            status = nvUvmInterfaceCtrlCmdOperateChannelGroup(&user_channel_group->parent->uuid,
+                                                     user_channel_group->group_id,
+                                                     user_channel_group->runlist_id,
+                                                     params->cmd,
+                                                     &params->data,
+                                                     params->dataSize);
+            if (status != NV_OK) {
+                return status;
+            }
+        }
+    }
+
+    return NV_OK;
+}
+
+static NV_STATUS uvm_api_ctrl_cmd_operate_channel(UVM_CTRL_CMD_OPERATE_CHANNEL_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_gpu_va_space_t *gpu_va_space;
+    uvm_user_channel_t *user_channel;
+    NV_STATUS status;
+
+    for_each_gpu_va_space(gpu_va_space, va_space) {
+        list_for_each_entry(user_channel, &gpu_va_space->registered_channels, list_node) {
+            status = nvUvmInterfaceCtrlCmdOperateChannel(user_channel->rm_retained_channel,
+                                                     params->cmd,
+                                                     &params->data,
+                                                     params->dataSize);
+            if (status != NV_OK) {
+                return status;
+            }
+        }
+    }
+
+    return NV_OK;
+}
+
+static NV_STATUS uvm_api_set_gmemcg(UVM_SET_GMEMCG_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_gpu_id_t id;
+
+    if (!va_space) {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    for_each_gpu_id(id) {
+        va_space->gmemcghigh[uvm_id_gpu_index(id)] = params->size;
+    }
+
+    return try_charge_gpu_memcg(va_space);
+}
+
 static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     switch (cmd)
@@ -1068,6 +1138,10 @@ static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_V2,uvm_api_tools_get_processor_uuid_table_v2);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_ALLOC_DEVICE_P2P,               uvm_api_alloc_device_p2p);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_CLEAR_ALL_ACCESS_COUNTERS,      uvm_api_clear_all_access_counters);
+        UVM_ROUTE_CMD_STACK_NO_INIT_CHECK(UVM_IS_INITIALIZED,              uvm_api_is_initialized);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_CTRL_CMD_OPERATE_CHANNEL_GROUP,  uvm_api_ctrl_cmd_operate_channel_group);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_CTRL_CMD_OPERATE_CHANNEL,        uvm_api_ctrl_cmd_operate_channel);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_SET_GMEMCG,                      uvm_api_set_gmemcg);
     }
 
     // Try the test ioctls if none of the above matched

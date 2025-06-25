@@ -190,6 +190,8 @@ NV_STATUS uvm_va_space_create(struct address_space *mapping, uvm_va_space_t **va
         return NV_ERR_INVALID_ARGUMENT;
     }
 
+    memset(va_space->gmemcghigh, 0xFF, sizeof(size_t) * UVM_ID_MAX_GPUS);
+
     uvm_init_rwsem(&va_space->lock, UVM_LOCK_ORDER_VA_SPACE);
     uvm_mutex_init(&va_space->closest_processors.mask_mutex, UVM_LOCK_ORDER_LEAF);
     uvm_mutex_init(&va_space->serialize_writers_lock, UVM_LOCK_ORDER_VA_SPACE_SERIALIZE_WRITERS);
@@ -1495,6 +1497,7 @@ static NV_STATUS create_gpu_va_space(uvm_gpu_t *gpu,
     gpu_va_space->gpu = gpu;
     gpu_va_space->va_space = va_space;
     INIT_LIST_HEAD(&gpu_va_space->registered_channels);
+    INIT_LIST_HEAD(&gpu_va_space->registered_channel_groups);
     INIT_LIST_HEAD(&gpu_va_space->channel_va_ranges);
     nv_kref_init(&gpu_va_space->kref);
 

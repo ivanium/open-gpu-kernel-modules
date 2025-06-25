@@ -1121,6 +1121,66 @@ typedef struct
     NV_STATUS       rmStatus; // OUT
 } UVM_CLEAR_ALL_ACCESS_COUNTERS_PARAMS;
 
+#define UVM_IS_INITIALIZED                                            UVM_IOCTL_BASE(80)
+typedef struct
+{
+    NvBool          initialized; // OUT
+    NV_STATUS       rmStatus;    // OUT
+} UVM_IS_INITIALIZED_PARAMS;
+
+#define UVM_CTRL_CMD_OPERATE_CHANNEL_GROUP                             UVM_IOCTL_BASE(81)
+typedef struct
+{
+    NvU32           cmd;                  // IN
+    union {
+        struct {
+            NvU64       timesliceUs;      // IN
+        } NVA06C_CTRL_TIMESLICE_PARAMS;
+        struct {
+            NvBool bWait;                 // IN
+            NvBool bManualTimeout;        // IN
+            NvU32  timeoutUs;             // IN
+        } NVA06C_CTRL_CMD_PREEMPT;
+        struct {
+            NvBool bEnable;               // IN
+            NvBool bSkipSubmit;           // IN
+            NvBool bSkipEnable;           // IN
+        } NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS;
+        struct {
+            NvU32 tsgInterleaveLevel;     // IN
+        } NVA06C_CTRL_INTERLEAVE_LEVEL_PARAMS;
+    } data;
+    NvU32           dataSize;             // IN
+    NV_STATUS       rmStatus;             // OUT
+} UVM_CTRL_CMD_OPERATE_CHANNEL_GROUP_PARAMS;
+
+#define UVM_CTRL_CMD_OPERATE_CHANNEL                                   UVM_IOCTL_BASE(82)
+typedef struct
+{
+    NvU32               cmd;                    // IN
+    union {
+        struct {
+            NvBool bForceRestart;
+            NvBool bBypassWait;
+        } NVA06F_CTRL_RESTART_RUNLIST_PARAMS;
+        struct {
+            NvBool bImmediate;
+        } NVA06F_CTRL_STOP_CHANNEL_PARAMS;
+        struct {
+            NvU32 engineType;
+        } NVA06F_CTRL_BIND_PARAMS;
+    } data;
+    NvU32               dataSize;               // IN
+    NV_STATUS           rmStatus;               // OUT
+} UVM_CTRL_CMD_OPERATE_CHANNEL_PARAMS;
+
+#define UVM_SET_GMEMCG                                                UVM_IOCTL_BASE(83)
+typedef struct
+{
+    NvU64               size;     // IN
+    NV_STATUS           rmStatus; // OUT
+} UVM_SET_GMEMCG_PARAMS;
+
 //
 // Temporary ioctls which should be removed before UVM 8 release
 // Number backwards from 2047 - highest custom ioctl function number

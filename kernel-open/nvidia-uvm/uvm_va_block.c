@@ -98,6 +98,111 @@ static size_t block_gpu_chunk_index(uvm_va_block_t *block,
                                     uvm_page_index_t page_index,
                                     uvm_chunk_size_t *out_chunk_size);
 
+static NV_STATUS block_evict_pages_from_gpu(uvm_va_block_t *va_block, uvm_gpu_t *gpu, struct mm_struct *mm);
+
+static size_t va_space_calculate_rss(uvm_va_space_t *va_space, uvm_gpu_t *gpu) {
+    uvm_va_range_t *va_range;
+    uvm_va_range_managed_t *managed_range;
+    uvm_va_block_t *va_block;
+    uvm_va_block_gpu_state_t *gpu_state;
+    size_t va_range_num_blocks;
+    size_t index;
+    size_t rss = 0;
+    bool locked = uvm_check_rwsem_locked_read(&va_space->lock);
+
+    if (!locked) {
+        uvm_down_read(&va_space->lock);
+    }
+
+    uvm_for_each_va_range(va_range, va_space) {
+        managed_range = uvm_va_range_to_managed_or_null(va_range);
+        if (managed_range) {
+            va_range_num_blocks = uvm_va_range_num_blocks(managed_range);
+            for (index = 0; index < va_range_num_blocks; ++index) {
+                va_block = uvm_va_range_block(managed_range, index);
+                if (va_block) {
+                    gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+                    rss += uvm_page_mask_weight(&gpu_state->resident) * 4096;
+                }
+            }
+        }
+    }
+
+    if (!locked) {
+        uvm_up_read(&va_space->lock);
+    }
+
+    return rss;
+}
+
+static NV_STATUS uvm_va_space_evict_size(uvm_va_space_t *va_space, uvm_gpu_t *gpu, size_t target_size) {
+    uvm_va_range_t *va_range;
+    uvm_va_range_managed_t *managed_range;
+    uvm_va_block_t *va_block;
+    uvm_va_block_gpu_state_t *gpu_state;
+    struct mm_struct *mm;
+    size_t va_range_num_blocks;
+    size_t index;
+    size_t evicted_size = 0;
+    NV_STATUS status = NV_OK;
+
+    uvm_assert_rwsem_locked_write(&va_space->lock);
+    mm = uvm_va_space_mm_retain_lock(va_space);
+
+    uvm_for_each_va_range(va_range, va_space) {
+        managed_range = uvm_va_range_to_managed_or_null(va_range);
+        if (managed_range) {
+            va_range_num_blocks = uvm_va_range_num_blocks(managed_range);
+            for (index = 0; index < va_range_num_blocks; ++index) {
+                va_block = uvm_va_range_block(managed_range, index);
+                if (va_block) {
+                    gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+                    evicted_size += uvm_page_mask_weight(&gpu_state->resident) * 4096;
+                    status = block_evict_pages_from_gpu(va_block, gpu, mm);
+                    if (status != NV_OK || evicted_size >= target_size) {
+                        goto exit;
+                    }
+                }
+            }
+        }
+    }
+
+exit:
+    uvm_va_space_mm_release_unlock(va_space, mm);
+    return status;
+}
+
+NV_STATUS try_charge_gpu_memcg(uvm_va_space_t *va_space) {
+    uvm_gpu_id_t id;
+    uvm_gpu_t *gpu;
+    size_t rss;
+    size_t gmemcghigh;
+    NV_STATUS status = NV_OK;
+    bool locked = uvm_check_rwsem_locked_read(&va_space->lock);
+
+    if (!locked) {
+        uvm_down_read(&va_space->lock);
+    }
+
+    for_each_gpu_id(id) {
+        gpu = uvm_gpu_get(id);
+        if (gpu) {
+            rss = va_space_calculate_rss(va_space, gpu);
+            printk(KERN_INFO "Charging for gpu %d whose rss is %lld\n", uvm_id_gpu_index(id), rss);
+            gmemcghigh = va_space->gmemcghigh[uvm_id_gpu_index(id)];
+            if (rss > gmemcghigh) {
+                status = uvm_va_space_evict_size(va_space, gpu, rss - gmemcghigh);
+            }
+        }
+    }
+
+    if (!locked) {
+        uvm_up_read(&va_space->lock);
+    }
+
+    return status;
+}
+
 uvm_va_space_t *uvm_va_block_get_va_space_maybe_dead(uvm_va_block_t *va_block)
 {
 #if UVM_IS_CONFIG_HMM()
