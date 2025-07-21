@@ -368,6 +368,7 @@ struct gpuRetainedChannel_struct
     MEMORY_DESCRIPTOR           *instanceMemDesc;
     MEMORY_DESCRIPTOR           *resourceMemDesc[UVM_GPU_CHANNEL_MAX_RESOURCES];
     UVM_GPU_CHANNEL_ENGINE_TYPE channelEngineType;
+    NvU32                       hwChannelEngineType;
     NvU32                       resourceCount;
     NvU32                       chId;
     NvU32                       runlistId;
@@ -708,6 +709,7 @@ cleanup:
     return status;
 }
 
+// MARK: Build client with kernel metadata
 static NV_STATUS nvGpuOpsCreateClient(RM_API *pRmApi, NvHandle *hClient)
 {
     NV_STATUS status;
@@ -9328,7 +9330,8 @@ static NV_STATUS nvGpuOpsVerifyChannel(struct gpuAddressSpace *vaSpace,
 
 static NV_STATUS nvGpuOpsGetChannelEngineType(OBJGPU *pGpu,
                                               KernelChannel *pKernelChannel,
-                                              UVM_GPU_CHANNEL_ENGINE_TYPE *engineType)
+                                              UVM_GPU_CHANNEL_ENGINE_TYPE *engineType,
+                                              NvU32 *hwEngineType)
 {
     KernelFifo *pKernelFifo = GPU_GET_KERNEL_FIFO(pGpu);
     NvU32 engDesc;
@@ -9349,6 +9352,8 @@ static NV_STATUS nvGpuOpsGetChannelEngineType(OBJGPU *pGpu,
                                       (NvU32 *)&rmEngineType);
     if (status != NV_OK)
         return status;
+
+    *hwEngineType = rmEngineType;
 
     if (RM_ENGINE_TYPE_IS_GR(rmEngineType))
         *engineType = UVM_GPU_CHANNEL_ENGINE_TYPE_GR;
@@ -9684,7 +9689,7 @@ NV_STATUS nvGpuOpsRetainChannel(struct gpuAddressSpace *vaSpace,
     channel->chId = pKernelChannel->ChID;
     channel->runlistId = kchannelGetRunlistId(pKernelChannel);
 
-    status = nvGpuOpsGetChannelEngineType(pGpu, pKernelChannel, &channel->channelEngineType);
+    status = nvGpuOpsGetChannelEngineType(pGpu, pKernelChannel, &channel->channelEngineType, &channel->hwChannelEngineType);
     if (status != NV_OK)
         goto error;
 
@@ -9791,6 +9796,7 @@ NV_STATUS nvGpuOpsRetainChannel(struct gpuAddressSpace *vaSpace,
     }
 
     channelInstanceInfo->channelEngineType = channel->channelEngineType;
+    channelInstanceInfo->hwChannelEngineType = channel->hwChannelEngineType;
     *retainedChannel = channel;
 
     _nvGpuOpsLocksRelease(&acquiredLocks);
@@ -11344,4 +11350,168 @@ NV_STATUS nvGpuOpsLogEncryption(struct ccslContext_t *ctx,
     }
 
     return ccslLogEncryption(ctx, direction, bufferSize);
+}
+
+NV_STATUS nvGpuOpsCtrlCmdOperateChannelGroup(NvProcessorUuid *uuid,
+                                             NvU32 tsgId,
+                                             NvU32 runlistId,
+                                             NvU32 cmd,
+                                             NvP64 pParams,
+                                             NvU32 dataSize)
+{
+    NV_STATUS status = NV_OK;
+    nvGpuOpsLockSet acquiredLocks;
+    THREAD_STATE_NODE threadState;
+    OBJGPU *pGpu;
+    RM_API *pRmApi;
+    KernelFifo *pKernelFifo;
+    RsResourceRef *pResourceRef;
+    KernelChannelGroup *pKernelChannelGroup;
+    KernelChannelGroupApi *pKernelChannelGroupApi;
+    NvU32 rmapiStartTimeSec;
+    NvU32 rmapiStartTimeUSec;
+    NvU32 rmapiEndTimeSec;
+    NvU32 rmapiEndTimeUSec;
+
+    pGpu = gpumgrGetGpuFromUuid(uuid->uuid,
+        DRF_DEF(2080_GPU_CMD, _GPU_GET_GID_FLAGS, _TYPE, _SHA1) |
+        DRF_DEF(2080_GPU_CMD, _GPU_GET_GID_FLAGS, _FORMAT, _BINARY));
+    if (!pGpu) {
+        status = NV_ERR_INVALID_ARGUMENT;
+        goto done;
+    }
+
+    pKernelFifo = GPU_GET_KERNEL_FIFO(pGpu);
+    if (!pKernelFifo) {
+        status = NV_ERR_INVALID_OBJECT;
+        goto done;
+    }
+
+    pKernelChannelGroup = kfifoGetChannelGroup(pGpu, pKernelFifo, tsgId, runlistId);
+    if (!pKernelChannelGroup) {
+        status = NV_ERR_INVALID_ARGUMENT;
+        goto done;
+    }
+    pKernelChannelGroupApi = pKernelChannelGroup->pChanList->pHead->pKernelChannel->pKernelChannelGroupApi;
+    if (!pKernelChannelGroupApi) {
+        status = NV_ERR_INVALID_OBJECT;
+        goto done;
+    }
+
+    // Bug: Incorrect order of acquiring lock
+    // TODO: Store pKernelChannelGroupApi handle elsewhere to acquire lock before getting pKernelChannelGroupApi
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    if ((status = _nvGpuOpsLocksAcquireAll(RMAPI_LOCK_FLAGS_READ,
+                                           RES_GET_CLIENT_HANDLE(pKernelChannelGroupApi),
+                                           NULL,
+                                           &acquiredLocks)) != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        goto done;
+    }
+
+    pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);
+    if (!pRmApi) {
+        _nvGpuOpsLocksRelease(&acquiredLocks);
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        status = NV_ERR_INVALID_OBJECT;
+        goto done;
+    }
+
+    status = serverutilGetResourceRef(RES_GET_CLIENT_HANDLE(pKernelChannelGroupApi), RES_GET_HANDLE(pKernelChannelGroupApi), &pResourceRef);
+    if (status != NV_OK)
+    {
+        _nvGpuOpsLocksRelease(&acquiredLocks);
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        goto done;
+    }
+
+    os_get_current_time(&rmapiStartTimeSec, &rmapiStartTimeUSec);
+    NV_ASSERT_OK(
+        pRmApi->Control(pRmApi,
+                        RES_GET_CLIENT_HANDLE(pKernelChannelGroupApi),
+                        RES_GET_HANDLE(pKernelChannelGroupApi),
+                        cmd,
+                        pParams,
+                        dataSize));
+    os_get_current_time(&rmapiEndTimeSec, &rmapiEndTimeUSec);
+    if (cmd == NVA06C_CTRL_CMD_SET_TIMESLICE || cmd == NVA06C_CTRL_CMD_PREEMPT) {
+        NV_PRINTF(LEVEL_ERROR, "%s: cmd 0x%x spent %d us\n", __FUNCTION__, cmd, (rmapiEndTimeSec * 1000000 + rmapiEndTimeUSec) - (rmapiStartTimeSec * 1000000 + rmapiStartTimeUSec));
+    }
+
+    _nvGpuOpsLocksRelease(&acquiredLocks);
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+
+done:
+    return status;
+}
+
+NV_STATUS nvGpuOpsCtrlCmdOperateChannel(gpuRetainedChannel *retainedChannel,
+                                        NvU32 cmd,
+                                        NvP64 pParams,
+                                        NvU32 dataSize)
+{
+    NV_STATUS status = NV_OK;
+    nvGpuOpsLockSet acquiredLocks;
+    THREAD_STATE_NODE threadState;
+    KernelChannel *pKernelChannel = NULL;
+    RsResourceRef *pResourceRef;
+    NvU32 rmapiStartTimeSec;
+    NvU32 rmapiStartTimeUSec;
+    NvU32 rmapiEndTimeSec;
+    NvU32 rmapiEndTimeUSec;
+    RM_API *pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    if (_nvGpuOpsLocksAcquireAll(RMAPI_LOCK_FLAGS_READ,
+                                 retainedChannel->session->handle,
+                                 NULL,
+                                 &acquiredLocks) != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    status = nvGpuOpsGetChannelData(retainedChannel, &pKernelChannel);
+    if (status != NV_OK)
+    {
+        _nvGpuOpsLocksRelease(&acquiredLocks);
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    // Verify this channel handle is still valid
+    status = serverutilGetResourceRef(RES_GET_CLIENT_HANDLE(pKernelChannel), RES_GET_HANDLE(pKernelChannel), &pResourceRef);
+    if (status != NV_OK)
+    {
+        NV_ASSERT(0);
+        _nvGpuOpsLocksRelease(&acquiredLocks);
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    if (cmd == NVA06F_CTRL_CMD_BIND) {
+        ((NVA06F_CTRL_BIND_PARAMS *)pParams)->engineType = retainedChannel->hwChannelEngineType;
+    }
+
+    os_get_current_time(&rmapiStartTimeSec, &rmapiStartTimeUSec);
+    NV_ASSERT_OK(
+        pRmApi->Control(pRmApi,
+                        RES_GET_CLIENT_HANDLE(pKernelChannel),
+                        RES_GET_HANDLE(pKernelChannel),
+                        cmd,
+                        pParams,
+                        dataSize));
+    os_get_current_time(&rmapiEndTimeSec, &rmapiEndTimeUSec);
+
+    if (cmd == NVA06F_CTRL_CMD_BIND || cmd == NVA06F_CTRL_CMD_STOP_CHANNEL || cmd == NVA06F_CTRL_CMD_GPFIFO_SCHEDULE) {
+        NV_PRINTF(LEVEL_ERROR, "%s: cmd 0x%x spent %d us\n", __FUNCTION__, cmd, (rmapiEndTimeSec * 1000000 + rmapiEndTimeUSec) - (rmapiStartTimeSec * 1000000 + rmapiStartTimeUSec));
+    }
+
+    _nvGpuOpsLocksRelease(&acquiredLocks);
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    return status;
 }
