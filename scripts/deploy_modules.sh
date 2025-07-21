@@ -22,8 +22,9 @@ sudo rmmod nvidia
 # Insert newly compiled modules
 sudo insmod kernel-open/nvidia.ko
 sudo insmod kernel-open/nvidia-uvm.ko
+sudo modprobe video  # needed for nvidia modeset
+sudo modprobe drm_ttm_helper # needed for nvidia drm
 sudo insmod kernel-open/nvidia-modeset.ko
 sudo insmod kernel-open/nvidia-drm.ko
 
 popd
-
